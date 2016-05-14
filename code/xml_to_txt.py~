@@ -1,0 +1,189 @@
+from lxml import etree
+import numpy as np
+from os import listdir
+from ohchr_document import Fragment, Line, Paragraph
+import re
+
+def getDocumentFragments(file_tree):
+    file_fragments = [] 
+    page_trees = file_tree.xpath('//page')
+    for page_tree in page_trees:
+        page_number = int(page_tree.xpath('./@number')[0])
+        page_fragments = []
+        text_trees = page_tree.xpath('.//text')
+        for text_tree in text_trees:
+            page_fragments.append(Fragment(page_number, text_tree))
+        page_fragments.sort(key = lambda(x): (x.top, x.left))
+        file_fragments.append(page_fragments)
+    
+    return(file_fragments)
+
+
+def findFirstPageStartIndex(first_page_fragments):
+    i = 0
+    while first_page_fragments[i].text[:13] != "Communication":
+        i += 1
+    return(i)
+
+def getLines(fragments):
+    lines = []
+    if len(fragments) > 0:
+        for fragment in fragments:
+            if len(fragment.text.strip()) > 0:
+                if len(lines) == 0:
+                    lines = [Line(fragment)]
+                elif lines[-1].canAddFragment(fragment):
+                    lines[-1].addFragment(fragment)
+                else:
+                    lines.append(Line(fragment))
+    return(lines)
+
+def getDistances(lines):
+    distances = [lines[i+1].top - lines[i].bottom for i in range(len(lines) - 1)]
+    return(distances)
+
+def getAllDistances(file_lines):
+    distances = []
+    for page_lines in file_lines:
+        distances += getDistances(page_lines)
+    return(distances)
+
+def removeHeader(page_lines):
+    id_number_re = re.compile('[a-z0-9.]+(/[a-z0-9&.]+)+')
+    page_re = re.compile('page?[0-9]+')
+    if len(page_lines) == 0:
+        return(page_lines)
+    i = 0
+    while page_lines[i].text == '':
+        i += 1
+    in_header = True
+    while(in_header):
+        line_text = page_lines[i].text.replace(' ', '').lower()
+        in_header = ((id_number_re.match(line_text) is not None and line_text == id_number_re.match(line_text).group()) or
+                     (page_re.match(line_text) is not None and line_text == page_re.match(line_text).group()))
+        if in_header:
+            i += 1
+    while page_lines[i].text == '':
+        i += 1
+    return(page_lines[i:])
+
+
+def getFootnoteLineIndex(lines):
+    i = 0
+    for line in lines:
+        line_fragments = sorted(line.text_fragments, key = lambda(x): x.left)
+        if (len(line_fragments) >= 2 and 
+            line_fragments[0].height < line_fragments[1].height):
+            try:
+                int(line_fragments[0].text)
+                return(i)
+            except:
+                pass
+        i += 1
+    return(None)
+
+def getParagraphs(lines, paragraph_distance):
+    paragraphs = []
+    distances = [lines[i+1].top - lines[i].bottom for i in range(len(lines) - 1)]
+    for i in range(len(lines)):
+        if len(paragraphs) == 0:
+            paragraphs = [Paragraph(lines[i])]
+        elif distances[i - 1] <= paragraph_distance:
+            paragraphs[-1].addLine(lines[i])
+        else:
+            paragraphs.append(Paragraph(lines[i]))
+    return(paragraphs)
+
+def getFootnotes(lines):
+    footnotes = []
+    for line in lines:
+        line_fragments = sorted(line.text_fragments, key = lambda(x): x.left)
+        if len(footnotes) == 0:
+            footnotes.append(Paragraph(line))
+        elif (len(line_fragments) >= 2 and 
+              line_fragments[0].height < line_fragments[1].height):
+            try:
+                int(line_fragments[0].text)
+                footnotes.append(Paragraph(line))
+            except:
+                footnotes[-1].addLine(line)
+        else:
+            footnotes[-1].addLine(line)
+    return(footnotes)
+
+def groupLines(lines, paragraph_distance):
+    footnote_line_index = getFootnoteLineIndex(lines)
+    if footnote_line_index is None:
+        paragraphs = getParagraphs(lines, paragraph_distance)
+        footnotes = []
+    else:
+        paragraphs = getParagraphs(lines[:footnote_line_index], paragraph_distance)
+        footnotes = getFootnotes(lines[footnote_line_index:])
+    return(paragraphs, footnotes)
+
+def consolidateParagraphs(paragraphs):
+    numbered_paragraph_re = re.compile('[0-9]+\.[0-9]*')
+    numbered_paragraphs_started = False
+    new_paragraphs = []
+    for paragraph in paragraphs:
+        if(numbered_paragraphs_started == False):
+            new_paragraphs.append(paragraph)
+            if(numbered_paragraph_re.match(paragraph.text) is not None and 
+               numbered_paragraph_re.match(paragraph.text).group()[0] == 0):
+                numbered_paragraphs_started = True
+        elif(numbered_paragraph_re.match(paragraph.text) is not None and
+             numbered_paragraph_re.match(paragraph.text).group()[0] == 0):
+             new_paragraphs.append(paragraph)
+        else:
+            new_paragraphs[-1].merge(paragraph)
+    return(new_paragraphs)  
+    
+    
+def getDocumentParagraphs(fragments):
+    start_index = findFirstPageStartIndex(fragments[0])
+    fragments[0] = fragments[0][start_index:]
+    file_lines = [getLines(page_fragments) for page_fragments in fragments]
+    distances = getAllDistances(file_lines)
+    paragraph_distance = np.median(distances)
+
+    file_paragraphs = []
+    file_footnotes = []
+    for page_lines in file_lines:
+        page_lines = removeHeader(page_lines)
+        page_paragraphs, page_footnotes = groupLines(page_lines, paragraph_distance)
+        page_paragraphs = consolidateParagraphs(page_paragraphs)
+        file_paragraphs += page_paragraphs
+        file_footnotes += page_footnotes
+    
+    return(file_paragraphs, file_footnotes)
+        
+    
+def main():
+    xml_directory = '../xml'
+    txt_directory = '../txt'
+        
+    for file_name in listdir(xml_directory)[:10]:
+    #for file_name in ['82dc9139af22e0bac08f393283bd35b2cedcf651.xml']:
+        try:
+            file_tree = etree.parse(xml_directory + '/' + file_name)
+            print("Loaded " + file_name)
+        except:
+            print("Error with " + file_name)
+            continue        
+        
+        
+        fragments = getDocumentFragments(file_tree)
+        file_paragraphs, file_footnotes = getDocumentParagraphs(fragments)
+    
+        body_file = open(txt_directory + '/' + file_name.split('.')[0] + '_body.txt', 'w')
+        for paragraph in file_paragraphs:
+            body_file.write(paragraph.text.encode('utf-8'))
+            body_file.write('\n')
+        body_file.close()
+
+        footnote_file = open(txt_directory + '/' + file_name.split('.')[0] + '_footnotes.txt', 'w')
+        for footnote in file_footnotes:
+            footnote_file.write(footnote.text.encode('utf-8'))
+            footnote_file.write('\n')
+        footnote_file.close()
+main()
